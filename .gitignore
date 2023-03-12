@@ -161,3 +161,7 @@ cython_debug/
 
 # macOS
 .DS_Store
+
+# Custom
+hacksquad/
+test_image.png

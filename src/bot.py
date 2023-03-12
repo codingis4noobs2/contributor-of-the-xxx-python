@@ -1,72 +1,142 @@
 # Imports.
-# import json
 import asyncio
-import aiohttp
-import urllib.request
+import logging
+from datetime import datetime
 from typing import Any
 
+import aiocron
+import aiohttp
 from PIL import Image
-from dotenv import dotenv_values
+
+from src import secrets
+from src.models import Contributor, Organization
+
+logging.basicConfig(level=logging.INFO)
+headers = {"Authorization": f"token {secrets.github_token}"}
+start_time = datetime.utcnow()
+org_name = secrets.github_org_name
 
 
-# Bot class.
 class Bot:
-    CONFIG = dotenv_values('.env')
-
     def __init__(self) -> None:
         pass
 
-    async def get_data(self) -> Any:
-        '''
-        GET github data by making a simple request to GitHub's REST API.
-        '''
-        async with aiohttp.ClientSession() as session:
-            org = self.CONFIG['GITHUB_ORG_NAME']
-            repo = self.CONFIG['GITHUB_REPO_NAME']
-            api = "https://api.github.com/repos/{}/{}".format(org, repo) + \
-                "/contributors?q=contributions&order=desc"
-            async with session.get(api) as response:
-                data = await response.json()
+    async def get_contributor(self) -> Contributor | None:
+        """
+        GET top contributor data by making a simple request to GitHub's REST API.
+        """
 
-        return data
+        contributors = {}
+        bots = []
 
-    def get_data_before_run(func) -> Any:
-        '''
-        A simple decorator to return data retrieved from GitHub's REST API.
-        '''
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for page in range(1, 100):
+                api = "https://api.github.com/search/issues" + f"?q=org:{org_name}&sort=created&per_page=100&page={page}"
+
+                async with session.get(api) as response:
+                    data = await response.json()
+
+                if not data.get("items"):
+                    break
+
+                for item in data["items"]:
+                    handle = item["user"]["login"]
+                    if item.get("pull_request"):
+                        pull = item["pull_request"]
+                        if pull["merged_at"] is not None:
+                            difference = start_time - datetime.fromisoformat(pull["merged_at"][0:10])
+
+                            if difference.days > int(secrets.time_period_days):
+                                break
+
+                            if handle not in list(contributors.keys()) + bots + secrets.excluded_profiles:
+                                contributors[handle] = {"pr_count": 0, "issue_count": 0}
+                                if item["user"]["type"] == "Bot":
+                                    bots += item["user"]["login"]
+                                    contributors.pop(handle)
+                            if handle in contributors:
+                                contributors[handle]["pr_count"] += 1
+
+                    else:
+                        difference = start_time - datetime.fromisoformat(item["created_at"][0:10])
+
+                        if difference.days > int(secrets.time_period_days):
+                            break
+
+                        if handle not in list(contributors.keys()) + bots + secrets.excluded_profiles:
+                            contributors[handle] = {"pr_count": 0, "issue_count": 0}
+                            if item["user"]["type"] == "Bot":
+                                bots += item["user"]["login"]
+                                contributors.pop(handle)
+                        if handle in contributors:
+                            contributors[handle]["issue_count"] += 1
+
+        contributors = sorted(contributors.items(), key=lambda x: x[1]["pr_count"], reverse=True)
+
+        if contributors:
+            return contributors[0]
+        else:
+            return None
+
+    def get_contributor_before_run(func) -> Any:
+        """
+        A simple decorator to return top contributor data retrieved from GitHub's REST API.
+        """
 
         async def wrapper(self):
-            data = await self.get_data()
-            return func(self, data)
+            data = await self.get_contributor()
+            return await func(self, data)
 
         return wrapper
 
-    @get_data_before_run
-    def show_top_avatar(self, data) -> None:
-        '''
-        Shows the avatar of the top contributor using Pillow.
-        '''
+    @get_contributor_before_run
+    async def run_once(self, contributor: Any) -> None:
+        """
+        Shows the avatar of the top contributor.
+        """
+        if contributor:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                org_api = f"https://api.github.com/orgs/{org_name}"
+                async with session.get(org_api) as response:
+                    data = await response.json()
+                    organization = Organization(
+                        login=data["login"],
+                        avatar_url=data["avatar_url"],
+                    )
 
-        # Retrieving the user's avatar and saving it.
-        avatar = data[0]['avatar_url']
-        urllib.request.urlretrieve(avatar, 'avatar.png')
-        img = Image.open('avatar.png')
-        img.show()
-
-    def run(self) -> None:
-        '''
-        Run the required functions in order for the bot.
-        '''
-
-        async def every(seconds: float):
-            while True:
-                await self.show_top_avatar()
-                await asyncio.sleep(seconds)
-
-        loop = asyncio.get_event_loop()
-        loop.create_task(
-            every(
-                seconds=3600 * 24 * int(self.CONFIG['TIME_PERIOD_DAYS'])
+                user_api = f"https://api.github.com/users/{contributor[0]}"
+                async with session.get(user_api) as response:
+                    data = await response.json()
+            contributor = Contributor(
+                data=data, organization=organization, pr_count=contributor[1]["pr_count"], issue_count=contributor[1]["issue_count"]
             )
-        )
-        loop.run_forever()
+            image = await contributor.generate_image()
+            if not secrets.test_mode:
+                try:
+                    await contributor.post_to_discord()
+                    await contributor.post_to_twitter()
+                except Exception as e:
+                    logging.error(f"{datetime.now()} -> Cannot post to Discord or Twitter\nError: {e}")
+            else:
+                file_name = "test_image.png"
+                image.save(file_name)
+
+                preview = Image.open(file_name)
+                preview.show()
+
+            logging.info(f"{datetime.now()} -> Top Contributor: {contributor.login}")
+
+        else:
+            logging.info(f"{datetime.now()} -> No contributor for the given time period.")
+
+    @staticmethod
+    @aiocron.crontab(f"0 0 */{secrets.time_period_days} * *")
+    async def every() -> None:
+        bot = Bot()
+        await bot.run_once()
+
+    def run(self, *, run_at_start: bool = False) -> None:
+        if run_at_start:
+            asyncio.get_event_loop().run_until_complete(self.run_once())
+
+        asyncio.get_event_loop().run_forever()
